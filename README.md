@@ -164,7 +164,7 @@ npm --prefix ./web run lint
 
 ## 项目来源与修改说明
 
-本项目基于 [Willxup/cpa-usage-keeper](https://github.com/Willxup/cpa-usage-keeper) 修改而来，不是原项目的官方版本。当前版本是一个纯前端展示版本。
+本项目基于 [Willxup/cpa-usage-keeper](https://github.com/Willxup/cpa-usage-keeper) 修改而来，不是原项目的官方版本。当前版本是一个纯前端展示版本。感谢原作者的开源精神和原项目提供的基础实现。
 
 当前版本已经移除了原项目中的全部后端相关内容，包括 Go 服务、数据库、Redis 队列、定时任务、登录接口、部署脚本以及后端 API 依赖。项目只保留前端页面和数据展示逻辑，通过读取静态 JSON 文件来展示使用量、请求事件、模型统计和价格信息。
 
