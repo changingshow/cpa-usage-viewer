@@ -11,6 +11,9 @@ export interface StatusResponse {
   last_run_at?: string
   data_range_start?: string
   data_range_end?: string
+  data_source?: 'default-file' | 'indexeddb'
+  data_source_file?: string
+  data_source_imported_at?: string
   last_error?: string
   last_warning?: string
   last_status?: string

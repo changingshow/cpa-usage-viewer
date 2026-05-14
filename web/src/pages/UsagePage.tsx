@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback, useEffect, useRef, type KeyboardEvent, type SyntheticEvent } from 'react';
+import { useState, useMemo, useCallback, useEffect, useRef, type ChangeEvent, type KeyboardEvent, type SyntheticEvent } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   Chart as ChartJS,
@@ -13,15 +13,15 @@ import {
   Legend,
   Filler
 } from 'chart.js';
-import { ApiError, fetchStatus, fetchUpdateCheck, fetchUsageAnalysis, fetchUsageEventModelFilterOptions, fetchUsageEventSourceFilterOptions, fetchUsageEvents } from '@/lib/api';
+import { ApiError, clearImportedUsageJson, fetchStatus, fetchUpdateCheck, fetchUsageAnalysis, fetchUsageEventModelFilterOptions, fetchUsageEventSourceFilterOptions, fetchUsageEvents, importUsageJsonFile } from '@/lib/api';
 import type { StatusResponse, UsageAnalysisResponse, UsageEvent, UsageSourceFilterOption } from '@/lib/types';
 import { LoadingSpinner } from '@/components/ui/LoadingSpinner';
 import { LanguageSwitcher } from '@/components/ui/LanguageSwitcher';
 import { Select } from '@/components/ui/Select';
-import { IconRefreshCw } from '@/components/ui/icons';
+import { IconRefreshCw, IconTrash2, IconUpload } from '@/components/ui/icons';
 import { useMediaQuery } from '@/hooks/useMediaQuery';
 import { useHeaderRefresh } from '@/hooks/useHeaderRefresh';
-import { useThemeStore } from '@/stores';
+import { useThemeStore, useUsageStatsStore } from '@/stores';
 import {
   StatCards,
   UsageChart,
@@ -484,6 +484,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
   const theme = useThemeStore((state) => state.theme);
   const resolvedTheme = useThemeStore((state) => state.resolvedTheme);
   const setTheme = useThemeStore((state) => state.setTheme);
+  const clearUsageStats = useUsageStatsStore((state) => state.clearUsageStats);
   const isDark = resolvedTheme === 'dark';
   const [activeTab, setActiveTab] = useState<UsageTab>(loadUsageTab);
   const [chartLines, setChartLines] = useState<string[]>(loadChartLines);
@@ -536,6 +537,8 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
   const eventsRequestControllerRef = useRef<AbortController | null>(null);
   const eventsFilterOptionsRequestControllerRef = useRef<AbortController | null>(null);
   const [manualRefreshLoading, setManualRefreshLoading] = useState(false);
+  const [usageImportLoading, setUsageImportLoading] = useState(false);
+  const usageImportInputRef = useRef<HTMLInputElement | null>(null);
   const [analysisLoading, setAnalysisLoading] = useState(false);
   const [analysisError, setAnalysisError] = useState('');
   const [analysisData, setAnalysisData] = useState<UsageAnalysisResponse>({ apis: [], models: [] });
@@ -929,6 +932,17 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
     await loadUsage();
   }, [activeTab, loadEvents, loadUsage]);
 
+  const refreshAfterUsageDataSourceChange = useCallback(async (nextStatus: StatusResponse) => {
+    clearUsageStats();
+    setStatus(nextStatus);
+    setStatusError(nextStatus.last_error || '');
+    setEventsPage(1);
+    setEventsModelFilter(ALL_REQUEST_EVENTS_FILTER);
+    setEventsSourceFilter(ALL_REQUEST_EVENTS_FILTER);
+    setEventsResultFilter(ALL_REQUEST_EVENTS_FILTER);
+    await refreshActiveTab();
+  }, [clearUsageStats, refreshActiveTab]);
+
   const autoRefreshEnabled = shouldAutoRefreshUsageTab({
     activeTab,
     eventsPage,
@@ -959,6 +973,44 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
       updateCheckNoticeTimerRef.current = null;
     }, getUpdateCheckToastDuration(kind));
   }, []);
+
+  const handleUsageImportClick = useCallback(() => {
+    usageImportInputRef.current?.click();
+  }, []);
+
+  const handleUsageImportChange = useCallback(async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+
+    setUsageImportLoading(true);
+    try {
+      const nextStatus = await importUsageJsonFile(file);
+      await refreshAfterUsageDataSourceChange(nextStatus);
+      showUpdateCheckNotice('success', t('usage_stats.import_success', { fileName: file.name || 'usage-latest.json' }));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : t('usage_stats.import_invalid');
+      setStatusError(message);
+      showUpdateCheckNotice('error', t('usage_stats.import_failed', { message }));
+    } finally {
+      setUsageImportLoading(false);
+    }
+  }, [refreshAfterUsageDataSourceChange, showUpdateCheckNotice, t]);
+
+  const handleClearImportedUsage = useCallback(async () => {
+    setUsageImportLoading(true);
+    try {
+      const nextStatus = await clearImportedUsageJson();
+      await refreshAfterUsageDataSourceChange(nextStatus);
+      showUpdateCheckNotice('info', t('usage_stats.clear_imported_success'));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : t('notification.refresh_failed');
+      setStatusError(message);
+      showUpdateCheckNotice('error', message);
+    } finally {
+      setUsageImportLoading(false);
+    }
+  }, [refreshAfterUsageDataSourceChange, showUpdateCheckNotice, t]);
 
   const handleUpdateCheck = useCallback(async () => {
     setUpdateCheckLoading(true);
@@ -1064,6 +1116,14 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
     if (!start || !end) return '';
     return `${formatMetaDateTime(start)} - ${formatMetaDateTime(end)}`;
   }, [status?.data_range_start, status?.data_range_end]);
+  const isUsingImportedUsage = status?.data_source === 'indexeddb';
+  const dataSourceLabel = useMemo(() => {
+    if (!status?.data_source) return '';
+    const fileName = status.data_source_file || 'usage-latest.json';
+    return status.data_source === 'indexeddb'
+      ? t('usage_stats.data_source_imported', { fileName })
+      : t('usage_stats.data_source_default', { fileName });
+  }, [status?.data_source, status?.data_source_file, t]);
   // 只有需要时间范围的 tab 才渲染 Range 控件，避免 Pricing 产生空白占位。
   const showRangeControls = shouldShowRangeControls(activeTab);
   const {
@@ -1228,20 +1288,66 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
               </div>
             )}
 
-            {(lastSyncAt || fileDataRangeLabel) && (
-              <div className={styles.toolbarMetaRow}>
+            <div className={styles.toolbarMetaRow}>
+              <div className={styles.toolbarMetaLeft}>
+                <div className={styles.importSwitcher} role="group" aria-label={t('usage_stats.import_json')}>
+                  <button
+                    type="button"
+                    className={`${styles.importPill} ${styles.importPillActive} ${usageImportLoading ? styles.importPillLoading : ''}`.trim()}
+                    onClick={handleUsageImportClick}
+                    disabled={usageImportLoading}
+                    aria-busy={usageImportLoading}
+                  >
+                    {usageImportLoading ? (
+                      <span className={styles.importPillInner}>
+                        <LoadingSpinner size={12} className={styles.refreshSpinner} />
+                        <span>{t('common.loading')}</span>
+                      </span>
+                    ) : (
+                      <span className={styles.importPillInner}>
+                        <IconUpload size={14} />
+                        <span>{t('usage_stats.import_json')}</span>
+                      </span>
+                    )}
+                  </button>
+                  {isUsingImportedUsage && (
+                    <button
+                      type="button"
+                      className={`${styles.importPill} ${styles.clearImportPill}`.trim()}
+                      onClick={() => void handleClearImportedUsage()}
+                      disabled={usageImportLoading}
+                    >
+                      <span className={styles.importPillInner}>
+                        <IconTrash2 size={14} />
+                        <span>{t('usage_stats.clear_imported_data')}</span>
+                      </span>
+                    </button>
+                  )}
+                </div>
+                <input
+                  ref={usageImportInputRef}
+                  type="file"
+                  accept=".json,application/json"
+                  className={styles.hiddenFileInput}
+                  onChange={(event) => void handleUsageImportChange(event)}
+                />
                 {lastSyncAt && (
                   <span className={styles.lastRefreshed}>
                     {t('usage_stats.last_updated')}: {formatMetaDateTime(lastSyncAt)}
                   </span>
                 )}
-                {fileDataRangeLabel && (
-                  <span className={`${styles.lastRefreshed} ${styles.fileDataRange}`}>
-                    {t('usage_stats.file_data_range')}: {fileDataRangeLabel}
+                {dataSourceLabel && (
+                  <span className={styles.dataSourceBadge}>
+                    {t('usage_stats.data_source')}: {dataSourceLabel}
                   </span>
                 )}
               </div>
-            )}
+              {fileDataRangeLabel && (
+                <span className={`${styles.lastRefreshed} ${styles.fileDataRange}`}>
+                  {t('usage_stats.file_data_range')}: {fileDataRangeLabel}
+                </span>
+              )}
+            </div>
 
             {updateCheckNotice && (
               <div

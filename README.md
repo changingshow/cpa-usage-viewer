@@ -1,6 +1,6 @@
 # Usage Latest Dashboard
 
-一个纯前端的 usage 数据看板。项目不再包含 Go 后端、数据库、Redis 消费、登录鉴权或同步任务；页面只读取静态文件 `usage-latest.json` 并展示其中已有的数据。
+一个纯前端的 usage 数据看板。项目不再包含 Go 后端、数据库、Redis 消费、登录鉴权或同步任务；页面默认读取静态文件 `usage-latest.json`，也支持在浏览器中手动导入本地 JSON 文件并展示其中已有的数据。
 
 ## 目录结构
 
@@ -48,6 +48,25 @@ web/public/usage-latest.json
 ```
 
 替换数据时，直接覆盖这个文件，然后刷新页面即可。
+
+页面顶部也提供“导入 JSON”按钮。手动导入本地文件后，页面会立即使用导入的数据，并把这份数据保存到浏览器 IndexedDB。下次打开同一个访问地址时，会优先读取 IndexedDB 里的导入数据；如果没有导入数据，才会读取默认的 `web/public/usage-latest.json`。
+
+读取优先级：
+
+```text
+IndexedDB 中的手动导入数据 > web/public/usage-latest.json
+```
+
+如果想恢复默认文件，可以点击页面顶部的“清除导入数据”。清除后不会删除项目目录里的 `usage-latest.json`，只会删除当前浏览器为当前站点保存的 IndexedDB 导入数据。
+
+IndexedDB 数据只保存在当前浏览器、当前站点地址下。例如下面两个地址会被浏览器视为不同站点，导入数据不会互通：
+
+```text
+http://localhost:5173/
+http://127.0.0.1:5173/
+```
+
+因此本地长期使用时，建议固定使用同一个访问地址。
 
 数据文件需要至少包含：
 
@@ -160,7 +179,7 @@ npm --prefix ./web run lint
 - 登录保护和 session
 - Docker/systemd/Release 工作流
 
-现在的应用只负责读取静态 JSON 并展示。数据生成、同步和导出需要在项目外部完成。
+现在的应用只负责读取 JSON 并展示。数据可以来自默认静态文件，也可以来自用户在页面中手动导入并保存到 IndexedDB 的文件。数据生成、同步和导出需要在项目外部完成。
 
 ## 项目来源与修改说明
 
@@ -170,7 +189,7 @@ npm --prefix ./web run lint
 
 也就是说，这个版本不再负责采集、同步、存储或生成数据；它只负责把已经准备好的文件内容展示出来。默认读取的文件包括：
 
-- `web/public/usage-latest.json`：使用量和请求事件数据
+- `web/public/usage-latest.json`：使用量和请求事件数据。页面中手动导入的 JSON 会优先保存并读取自浏览器 IndexedDB。
 - `web/public/model-prices.json`：模型价格配置
 
-如果后续需要更新展示数据，只需要替换对应 JSON 文件，或者通过环境变量把前端指向其它可被浏览器访问的 JSON 地址。
+如果后续需要更新展示数据，可以替换对应 JSON 文件、通过页面导入新的本地 JSON，或者通过环境变量把前端指向其它可被浏览器访问的 JSON 地址。

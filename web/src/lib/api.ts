@@ -34,6 +34,10 @@ const APP_BASE_PATH_PLACEHOLDER = '__APP_BASE_PATH__'
 const STATIC_USAGE_JSON_URL = import.meta.env.VITE_USAGE_JSON_URL?.trim() || 'usage-latest.json'
 const STATIC_MODEL_PRICES_URL = import.meta.env.VITE_MODEL_PRICES_URL?.trim() || 'model-prices.json'
 const STATIC_TIMEZONE = 'Asia/Shanghai'
+const IMPORTED_USAGE_DB_NAME = 'cpa-usage-viewer'
+const IMPORTED_USAGE_DB_VERSION = 1
+const IMPORTED_USAGE_STORE_NAME = 'usage-json'
+const IMPORTED_USAGE_RECORD_ID = 'usage-latest'
 const DEFAULT_EVENTS_PAGE_SIZE = 100
 const HOUR_MS = 60 * 60 * 1000
 const DAY_MINUTES = 24 * 60
@@ -64,10 +68,23 @@ interface StaticUsageExport {
   usage?: UsageSnapshot
 }
 
+type StaticUsageDataSource = 'default-file' | 'indexeddb'
+
+interface ImportedUsageRecord {
+  id: string
+  fileName: string
+  importedAt: string
+  size: number
+  payload: StaticUsageExport
+}
+
 interface StaticUsageState {
   exportedAt?: string
   dataRangeStart?: string
   dataRangeEnd?: string
+  dataSource: StaticUsageDataSource
+  sourceFileName: string
+  importedAt?: string
   usage: UsageSnapshot
   details: UsageDetailRecord[]
 }
@@ -102,6 +119,84 @@ function resolveStaticModelPricesUrl(): string {
   return new URL(STATIC_MODEL_PRICES_URL, base).toString()
 }
 
+function openImportedUsageDb(): Promise<IDBDatabase | null> {
+  if (typeof indexedDB === 'undefined') {
+    return Promise.resolve(null)
+  }
+
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(IMPORTED_USAGE_DB_NAME, IMPORTED_USAGE_DB_VERSION)
+    request.onupgradeneeded = () => {
+      const db = request.result
+      if (!db.objectStoreNames.contains(IMPORTED_USAGE_STORE_NAME)) {
+        db.createObjectStore(IMPORTED_USAGE_STORE_NAME, { keyPath: 'id' })
+      }
+    }
+    request.onsuccess = () => resolve(request.result)
+    request.onerror = () => reject(request.error ?? new Error('Failed to open IndexedDB'))
+    request.onblocked = () => reject(new Error('IndexedDB is blocked by another browser tab'))
+  })
+}
+
+function transactionDone(transaction: IDBTransaction): Promise<void> {
+  return new Promise((resolve, reject) => {
+    transaction.oncomplete = () => resolve()
+    transaction.onerror = () => reject(transaction.error ?? new Error('IndexedDB transaction failed'))
+    transaction.onabort = () => reject(transaction.error ?? new Error('IndexedDB transaction aborted'))
+  })
+}
+
+function requestResult<T>(request: IDBRequest<T>): Promise<T> {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result)
+    request.onerror = () => reject(request.error ?? new Error('IndexedDB request failed'))
+  })
+}
+
+async function getImportedUsageRecord(): Promise<ImportedUsageRecord | null> {
+  const db = await openImportedUsageDb()
+  if (!db) return null
+  try {
+    const transaction = db.transaction(IMPORTED_USAGE_STORE_NAME, 'readonly')
+    const request = transaction.objectStore(IMPORTED_USAGE_STORE_NAME).get(IMPORTED_USAGE_RECORD_ID) as IDBRequest<ImportedUsageRecord | undefined>
+    const result = await requestResult(request)
+    return result ?? null
+  } finally {
+    db.close()
+  }
+}
+
+async function saveImportedUsageRecord(record: ImportedUsageRecord): Promise<void> {
+  const db = await openImportedUsageDb()
+  if (!db) {
+    throw new ApiError('IndexedDB is not available in this browser.', 500)
+  }
+  try {
+    const transaction = db.transaction(IMPORTED_USAGE_STORE_NAME, 'readwrite')
+    transaction.objectStore(IMPORTED_USAGE_STORE_NAME).put(record)
+    await transactionDone(transaction)
+  } finally {
+    db.close()
+  }
+}
+
+async function deleteImportedUsageRecord(): Promise<void> {
+  const db = await openImportedUsageDb()
+  if (!db) return
+  try {
+    const transaction = db.transaction(IMPORTED_USAGE_STORE_NAME, 'readwrite')
+    transaction.objectStore(IMPORTED_USAGE_STORE_NAME).delete(IMPORTED_USAGE_RECORD_ID)
+    await transactionDone(transaction)
+  } finally {
+    db.close()
+  }
+}
+
+function invalidateStaticUsageState(): void {
+  staticUsageState = null
+  staticUsageStatePromise = null
+}
+
 function toNumber(value: unknown): number {
   const parsed = Number(value)
   return Number.isFinite(parsed) ? parsed : 0
@@ -128,35 +223,73 @@ function normalizeUsageSnapshot(value: Partial<UsageSnapshot> | undefined): Usag
   }
 }
 
+function parseStaticUsagePayload(value: unknown, sourceLabel: string): StaticUsageExport {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new ApiError(`${sourceLabel} is not a valid JSON object`, 422)
+  }
+  const payload = value as StaticUsageExport
+  if (!payload.usage || typeof payload.usage !== 'object' || Array.isArray(payload.usage)) {
+    throw new ApiError(`${sourceLabel} does not contain a usage object`, 422)
+  }
+  return payload
+}
+
+function buildStaticUsageState(
+  payload: StaticUsageExport,
+  source: {
+    dataSource: StaticUsageDataSource
+    sourceFileName: string
+    importedAt?: string
+  }
+): StaticUsageState {
+  const rawUsage = normalizeUsageSnapshot(payload.usage)
+  const rawDetails = collectUsageDetails(rawUsage)
+  const usage = rawDetails.length
+    ? normalizeUsageSnapshot(buildUsageFromDetails(rawDetails) as UsageSnapshot)
+    : rawUsage
+  const details = collectUsageDetails(usage)
+  const dataRange = getStaticUsageDataRange(details)
+  return {
+    exportedAt: payload.exported_at,
+    dataRangeStart: dataRange?.start,
+    dataRangeEnd: dataRange?.end,
+    dataSource: source.dataSource,
+    sourceFileName: source.sourceFileName,
+    importedAt: source.importedAt,
+    usage,
+    details,
+  }
+}
+
 async function loadStaticUsageState(): Promise<StaticUsageState> {
   if (staticUsageState) {
     return staticUsageState
   }
   if (!staticUsageStatePromise) {
     staticUsageStatePromise = (async () => {
+      const importedRecord = await getImportedUsageRecord().catch(() => null)
+      if (importedRecord) {
+        const nextState = buildStaticUsageState(
+          parseStaticUsagePayload(importedRecord.payload, importedRecord.fileName || 'Imported usage JSON'),
+          {
+            dataSource: 'indexeddb',
+            sourceFileName: importedRecord.fileName || 'usage-latest.json',
+            importedAt: importedRecord.importedAt,
+          }
+        )
+        staticUsageState = nextState
+        return nextState
+      }
+
       const response = await fetch(resolveStaticUsageJsonUrl(), { cache: 'no-store' })
       if (!response.ok) {
         throw new ApiError(`Failed to load ${STATIC_USAGE_JSON_URL}: ${response.status}`, response.status)
       }
-      const payload = await response.json() as StaticUsageExport
-      if (!payload.usage) {
-        throw new ApiError(`${STATIC_USAGE_JSON_URL} does not contain a usage object`, 422)
-      }
-
-      const rawUsage = normalizeUsageSnapshot(payload.usage)
-      const rawDetails = collectUsageDetails(rawUsage)
-      const usage = rawDetails.length
-        ? normalizeUsageSnapshot(buildUsageFromDetails(rawDetails) as UsageSnapshot)
-        : rawUsage
-      const details = collectUsageDetails(usage)
-      const dataRange = getStaticUsageDataRange(details)
-      const nextState: StaticUsageState = {
-        exportedAt: payload.exported_at,
-        dataRangeStart: dataRange?.start,
-        dataRangeEnd: dataRange?.end,
-        usage,
-        details,
-      }
+      const payload = parseStaticUsagePayload(await response.json(), STATIC_USAGE_JSON_URL)
+      const nextState = buildStaticUsageState(payload, {
+        dataSource: 'default-file',
+        sourceFileName: STATIC_USAGE_JSON_URL,
+      })
       staticUsageState = nextState
       return nextState
     })().catch((error) => {
@@ -634,6 +767,42 @@ export async function fetchUsedModels(_signal?: AbortSignal): Promise<UsedModels
   return { models: getModelNamesFromUsage(state.usage) }
 }
 
+export async function importUsageJsonFile(file: File): Promise<StatusResponse> {
+  const fileName = file.name?.trim() || 'usage-latest.json'
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(await file.text())
+  } catch {
+    throw new ApiError(`${fileName} is not valid JSON`, 422)
+  }
+
+  const payload = parseStaticUsagePayload(parsed, fileName)
+  const importedAt = new Date().toISOString()
+  const nextState = buildStaticUsageState(payload, {
+    dataSource: 'indexeddb',
+    sourceFileName: fileName,
+    importedAt,
+  })
+
+  await saveImportedUsageRecord({
+    id: IMPORTED_USAGE_RECORD_ID,
+    fileName,
+    importedAt,
+    size: file.size,
+    payload,
+  })
+
+  staticUsageState = nextState
+  staticUsageStatePromise = Promise.resolve(nextState)
+  return fetchStatus()
+}
+
+export async function clearImportedUsageJson(): Promise<StatusResponse> {
+  await deleteImportedUsageRecord()
+  invalidateStaticUsageState()
+  return fetchStatus()
+}
+
 export async function fetchStatus(_signal?: AbortSignal): Promise<StatusResponse> {
   const state = await loadStaticUsageState()
   return {
@@ -645,6 +814,9 @@ export async function fetchStatus(_signal?: AbortSignal): Promise<StatusResponse
     last_run_at: state.exportedAt,
     data_range_start: state.dataRangeStart,
     data_range_end: state.dataRangeEnd,
+    data_source: state.dataSource,
+    data_source_file: state.sourceFileName,
+    data_source_imported_at: state.importedAt,
     last_status: 'static-json',
   }
 }
