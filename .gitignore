@@ -1,0 +1,37 @@
+# Local environment
+.env
+.env.*
+*.local
+
+# Frontend dependencies and output
+web/node_modules/
+web/dist/
+web/dist-ssr/
+web/public/usage-latest.json
+
+# Local/runtime data kept outside the static app
+/data/
+/test/
+*.db
+*.db-*
+backups/
+.runtime-test/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Editor and OS files
+.DS_Store
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
